@@ -671,48 +671,57 @@ def check_similarity_report_mention(doc: Document) -> List[Issue]:
 # =========================
 # Word Comments injector (real comments in DOCX)
 # =========================
+import re
+import zipfile
+from lxml import etree
+
 NS = {
     "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
     "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+    "ct": "http://schemas.openxmlformats.org/package/2006/content-types",
 }
 
 def _qn(tag: str) -> str:
     prefix, local = tag.split(":")
     return f"{{{NS[prefix]}}}{local}"
 
-def add_word_comments(input_docx: str, issues: List[Issue], output_docx: str) -> None:
+def add_word_comments(input_docx: str, issues: list, output_docx: str) -> None:
     """
-    Adds true Word comments (sidebar) to paragraphs indicated by issue.anchor_paragraph_index.
-    Uses OOXML edits via zipfile + lxml.
+    Adds true Word sidebar comments to paragraphs indicated by issue.anchor_paragraph_index.
+    Fixes the common issue where comments don't show by also updating [Content_Types].xml.
     """
+
     # Group issues by paragraph index
-    by_p: Dict[int, List[Issue]] = {}
+    by_p = {}
     for iss in issues:
-        by_p.setdefault(max(0, iss.anchor_paragraph_index), []).append(iss)
+        by_p.setdefault(max(0, int(getattr(iss, "anchor_paragraph_index", 0))), []).append(iss)
 
     with zipfile.ZipFile(input_docx, "r") as zin:
         files = {name: zin.read(name) for name in zin.namelist()}
 
+    # Parse main document, rels, content types
     doc_xml = etree.fromstring(files["word/document.xml"])
     rels_xml = etree.fromstring(files["word/_rels/document.xml.rels"])
+    ct_xml = etree.fromstring(files["[Content_Types].xml"])
 
-    # Ensure comments part exists
     comments_name = "word/comments.xml"
+
+    # Create or load comments.xml
     if comments_name in files:
         comments_xml = etree.fromstring(files[comments_name])
-        # get max comment id
         existing_ids = comments_xml.xpath("//w:comment/@w:id", namespaces=NS)
         next_id = max([int(x) for x in existing_ids], default=-1) + 1
     else:
         comments_xml = etree.Element(_qn("w:comments"), nsmap={"w": NS["w"]})
         next_id = 0
 
-    # Ensure relationship to comments exists
+    # Ensure relationship to comments exists in document.xml.rels
     rels = rels_xml.xpath("//rel:Relationship", namespaces=NS)
-    has_comments_rel = any(r.get("Type", "").endswith("/comments") for r in rels)
+    has_comments_rel = any((r.get("Type") or "").endswith("/comments") for r in rels)
+
     if not has_comments_rel:
-        # new rId
+        # New rId
         existing_rids = []
         for r in rels:
             rid = r.get("Id", "")
@@ -720,24 +729,37 @@ def add_word_comments(input_docx: str, issues: List[Issue], output_docx: str) ->
             if m:
                 existing_rids.append(int(m.group(1)))
         new_rid = f"rId{(max(existing_rids) + 1) if existing_rids else 1}"
+
         rel_el = etree.SubElement(rels_xml, _qn("rel:Relationship"))
         rel_el.set("Id", new_rid)
         rel_el.set("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments")
         rel_el.set("Target", "comments.xml")
 
-    # All paragraphs
+    # Ensure [Content_Types].xml has Override for comments.xml (THIS IS THE KEY FIX)
+    overrides = ct_xml.xpath("//ct:Override", namespaces=NS)
+    has_override = any(o.get("PartName") == "/word/comments.xml" for o in overrides)
+    if not has_override:
+        ov = etree.SubElement(ct_xml, _qn("ct:Override"))
+        ov.set("PartName", "/word/comments.xml")
+        ov.set("ContentType", "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml")
+
+    # Paragraphs in body
     paras = doc_xml.xpath("//w:body/w:p", namespaces=NS)
 
-    def make_comment_text(iss: Issue) -> str:
-        return f"[{iss.severity}] {iss.rule_id}\n{iss.message}\nEvidence: {iss.evidence}\nWhere: {iss.location_hint}"
+    def make_comment_text(iss) -> str:
+        sev = getattr(iss, "severity", "Medium")
+        rid = getattr(iss, "rule_id", "RULE")
+        msg = getattr(iss, "message", "")
+        ev = getattr(iss, "evidence", "")
+        loc = getattr(iss, "location_hint", "")
+        return f"[{sev}] {rid}\n{msg}\nEvidence: {ev}\nWhere: {loc}"
 
-    # Insert comments
+    # Insert comments anchored to first run in the paragraph
     for pidx, plist in by_p.items():
         if pidx >= len(paras):
             continue
         p = paras[pidx]
 
-        # Find first run, else create one
         runs = p.xpath("./w:r", namespaces=NS)
         if runs:
             first_r = runs[0]
@@ -745,12 +767,11 @@ def add_word_comments(input_docx: str, issues: List[Issue], output_docx: str) ->
             first_r = etree.SubElement(p, _qn("w:r"))
             etree.SubElement(first_r, _qn("w:t")).text = ""
 
-        # For each issue, add a comment anchored to first run
         for iss in plist:
             cid = str(next_id)
             next_id += 1
 
-            # comments.xml entry
+            # Add comment node
             c_el = etree.SubElement(comments_xml, _qn("w:comment"))
             c_el.set(_qn("w:id"), cid)
             c_el.set(_qn("w:author"), "Thesis Compliance Checker")
@@ -761,7 +782,7 @@ def add_word_comments(input_docx: str, issues: List[Issue], output_docx: str) ->
             ct = etree.SubElement(cr, _qn("w:t"))
             ct.text = make_comment_text(iss)
 
-            # Anchor in document.xml: commentRangeStart, commentRangeEnd, commentReference
+            # Anchor range in paragraph
             start = etree.Element(_qn("w:commentRangeStart"))
             start.set(_qn("w:id"), cid)
 
@@ -772,19 +793,21 @@ def add_word_comments(input_docx: str, issues: List[Issue], output_docx: str) ->
             ref = etree.SubElement(ref_run, _qn("w:commentReference"))
             ref.set(_qn("w:id"), cid)
 
-            # Insert start before first run, end after first run, then reference after end
+            # Insert: start before first run, end after first run, then reference
             p.insert(p.index(first_r), start)
-            p.insert(p.index(first_r) + 2, end)      # +2 because start inserted
+            p.insert(p.index(first_r) + 2, end)
             p.insert(p.index(end) + 1, ref_run)
 
-    # Write back
+    # Write back to zip
     files["word/document.xml"] = etree.tostring(doc_xml, xml_declaration=True, encoding="UTF-8", standalone="yes")
     files["word/_rels/document.xml.rels"] = etree.tostring(rels_xml, xml_declaration=True, encoding="UTF-8", standalone="yes")
+    files["[Content_Types].xml"] = etree.tostring(ct_xml, xml_declaration=True, encoding="UTF-8", standalone="yes")
     files[comments_name] = etree.tostring(comments_xml, xml_declaration=True, encoding="UTF-8", standalone="yes")
 
     with zipfile.ZipFile(output_docx, "w", compression=zipfile.ZIP_DEFLATED) as zout:
         for name, content in files.items():
             zout.writestr(name, content)
+
 
 
 # =========================
@@ -829,3 +852,4 @@ def run_checks(docx_path: str, degree_type: str) -> Tuple[List[Issue], Dict]:
         "issues_low": low
     }
     return issues, meta
+
